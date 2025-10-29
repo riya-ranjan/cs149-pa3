@@ -13,6 +13,14 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "circleBoxTest.cu_inl"
+
+#include <thrust/device_ptr.h>    
+#include <thrust/device_vector.h> 
+#include <thrust/sequence.h>       
+#include <thrust/transform.h>  
+#include <thrust/scan.h>          
+#include <thrust/functional.h>     
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -31,6 +39,14 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+};
+
+struct RowID {
+    int numCols;
+    __host__ __device__
+    int operator()(int i) const {
+        return i / numCols;
+    }
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -384,7 +400,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
+__global__ void kernelRenderCircles(int *circle_indices, int numTiles) {
 
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
@@ -407,9 +423,19 @@ __global__ void kernelRenderCircles() {
     // pointer to this pixels RGBA in global image
     float4* imgPtr = reinterpret_cast<float4*>(&cuConstRendererParams.imageData[4 * (index)]);
 
-    // iterate through all the circles
-    for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
+    // figure out what tile we are in
+    int tile_index = ((x / 32) + (y / 32) * numTiles);
 
+    // get the index of the beginning of circle indices
+    int start_circle_index = tile_index * (cuConstRendererParams.numCircles);
+    
+    // iterate through all the circles
+    for (int arr_ind=start_circle_index; arr_ind<start_circle_index+cuConstRendererParams.numCircles; arr_ind++) {
+
+        int circleIndex = circle_indices[arr_ind];
+        if (circleIndex == 2)
+            printf("Getting circle %d for pixel in tile %d\n", circleIndex, tile_index);
+        if (arr_ind != 0 && circleIndex == 0) break;
         // params of the circle we're currently looking at
         int index3 = 3 * circleIndex;
         float px = cuConstRendererParams.position[index3];
@@ -427,7 +453,6 @@ __global__ void kernelRenderCircles() {
         // do nothing if the current pixel is not within the bounding box
         if (pixelCenterNormX < minX || pixelCenterNormX > maxX || minY > pixelCenterNormY || maxY <  pixelCenterNormY)  continue;
         
-
         //printf("the circle index %d has been detected\n", circleIndex);
         float2 pc = make_float2(pixelCenterNormX, pixelCenterNormY);
         float3 pos = make_float3(px, py, pz);
@@ -436,6 +461,47 @@ __global__ void kernelRenderCircles() {
         // imgPtr++;
     }
 
+}
+
+// kerneltSetTilesToCircles -- (CUDA device code)
+//
+// Sets the boolean index of tiles_to_circles to true if this particular
+// tile and circle intersect.
+// tile index: (overall index / numCircles)
+// circle index: (overall index % numCircles)
+__global__ void kernelSetTilesToCircles(uint8_t *tiles_and_circles, int length) {
+    int overall_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (overall_index >= length) return;
+    int tile_index = overall_index / cuConstRendererParams.numCircles;
+    int circle_index = overall_index % cuConstRendererParams.numCircles;
+    
+    int index3 = 3 * circle_index;
+    float circleX = cuConstRendererParams.position[index3];
+    float circleY = cuConstRendererParams.position[index3+1];
+    float circleRadius = cuConstRendererParams.radius[circle_index];
+
+    // each tile is 32 x 32
+    float boxL = (tile_index % (cuConstRendererParams.imageWidth / 32)) * 32;
+    float boxR = boxL + 32;
+    float boxT = (tile_index / (cuConstRendererParams.imageWidth / 32)) * 32;
+    float boxB = boxT + 32;
+
+    tiles_and_circles[overall_index] = 
+        static_cast<uint8_t>(circleInBoxConservative(circleX, circleY, circleRadius, boxL, boxR, boxT, boxB));
+}
+
+//kernelGetCircleIndices -- (CUDA device code)
+//
+// returns output to circle_indices that tell us which circles we care about for each tile
+// performs essentially a scatter
+__global__ void kernelGetCircleIndices(int *circle_indices, uint8_t *flags, int *scanned_tiles, int total_length) {
+    int overall_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (overall_index >= total_length) return;
+    int tile_index = overall_index / cuConstRendererParams.numCircles;
+
+    if (flags[overall_index]) {
+        circle_indices[scanned_tiles[overall_index] + tile_index * cuConstRendererParams.numCircles] = overall_index % cuConstRendererParams.numCircles;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -657,16 +723,47 @@ CudaRenderer::render() {
     // create array of tiles to circles 
     // tile index: (overall index / numCircles)
     // circle index: (overall index % numCircles)
-    bool *tiles_and_circles;
-    int total_length = numTiles * cuConstRendererParams.numCircles;
-    cudaMalloc(&tiles_and_circles, total_length);
+    uint8_t *tiles_and_circles;
+    int total_length = numTiles * numCircles;
+    cudaMalloc(&tiles_and_circles, total_length * sizeof(uint8_t));
 
     // number of blocks
     dim3 gridDim((total_length + blockDim.x - 1) / blockDim.x);
 
-    kernelSetTilesToCircles<<<gridDim, blockDim>>>(tiles_and_circles, )
+    // find all tiles/circles that intersect
+    kernelSetTilesToCircles<<<gridDim, blockDim>>>(tiles_and_circles, total_length);
+    cudaDeviceSynchronize();
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    // exclusive scan for each tile
+    int *scanned_tiles;
+    cudaMalloc(&scanned_tiles, total_length * sizeof(int));
+    perform_exclusive_scans(tiles_and_circles, scanned_tiles, total_length, numTiles);
+
+    // get all the correct circle indices using the flags, and our exclusive scan
+    int *circle_indices;
+    cudaMalloc(&circle_indices, total_length * sizeof(int));
+    cudaMemset(circle_indices, 0, total_length * sizeof(int));
+    kernelGetCircleIndices<<<gridDim, blockDim>>>(circle_indices, tiles_and_circles, scanned_tiles, total_length);
+    cudaDeviceSynchronize();
+    cudaFree(tiles_and_circles);
+    cudaFree(scanned_tiles);
+
+    // for each pixel, whatever tile the pixel is in, check for every overlapping circle how to 
+    // color the pixel
+    kernelRenderCircles<<<gridDim, blockDim>>>(circle_indices, numTiles);
+    cudaDeviceSynchronize();
+    cudaFree(circle_indices);
+}
+
+void
+CudaRenderer::perform_exclusive_scans(uint8_t *flags, int *output, int length, int numTiles) {
+    thrust::device_vector<int> keys(length);
+    thrust::sequence(keys.begin(), keys.end());
+    thrust::transform(keys.begin(), keys.end(), keys.begin(), RowID{numCircles});
+
+    thrust::device_ptr<uint8_t> in_ptr(flags);
+    thrust::device_ptr<int>     out_ptr(output);
+    thrust::exclusive_scan_by_key(keys.begin(), keys.end(), in_ptr, out_ptr, 0, thrust::equal_to<int>(), thrust::plus<int>());
     cudaDeviceSynchronize();
 }
 

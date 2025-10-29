@@ -38,6 +38,8 @@ class CudaRenderer : public CircleRenderer {
 
   void render();
 
+  void perform_exclusive_scans(uint8_t *flags, int *output, int length, int numTiles);
+
   void shadePixel(int circleIndex, float pixelCenterX, float pixelCenterY,
                   float px, float py, float pz, float* pixelData);
 };
