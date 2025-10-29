@@ -350,8 +350,8 @@ __global__ void kernelAdvanceSnowflake() {
 // given a pixel and a circle, determines the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
-__device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+__device__ __inline__ float4
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float4 existingColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -362,7 +362,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     // circle does not contribute to the image
     if (pixelDist > maxDist)
-        return;
+        return existingColor;
 
     float3 rgb;
     float alpha;
@@ -399,15 +399,75 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
-    float4 existingColor = *imagePtr;
+    //float4 existingColor = *imagePtr;
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
+    return newColor;
 
     // global memory write
-    *imagePtr = newColor;
+    //*imagePtr = newColor;
+
+    // END SHOULD-BE-ATOMIC REGION
+}
+
+// shadePixelSnowflake -- (CUDA device code)
+//
+// given a pixel and a circle, determines the contribution to the
+// pixel from the circle.  Update of the image is done in this
+// function.  Called by kernelRenderCircles()
+__device__ __inline__ float4
+shadePixelSnowflake(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float4 existingColor) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float rad = cuConstRendererParams.radius[circleIndex];;
+    float maxDist = rad * rad;
+
+    // circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return existingColor;
+
+    float3 rgb;
+    float alpha;
+
+    // there is a non-zero contribution.  Now compute the shading value
+
+    // suggestion: This conditional is in the inner loop.  Although it
+    // will evaluate the same for all threads, there is overhead in
+    // setting up the lane masks etc to implement the conditional.  It
+    // would be wise to perform this logic outside of the loop next in
+    // kernelRenderCircles.  (If feeling good about yourself, you
+    // could use some specialized template magic).
+    const float kCircleMaxAlpha = .5f;
+    const float falloffScale = 4.f;
+
+    float normPixelDist = sqrt(pixelDist) / rad;
+    rgb = lookupColor(normPixelDist);
+
+    float maxAlpha = .6f + .4f * (1.f-p.z);
+    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+    alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+    float oneMinusAlpha = 1.f - alpha;
+
+    // BEGIN SHOULD-BE-ATOMIC REGION
+    // global memory read
+
+    //float4 existingColor = *imagePtr;
+    float4 newColor;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    newColor.w = alpha + existingColor.w;
+    return newColor;
+
+    // global memory write
+    //*imagePtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
 }
@@ -417,7 +477,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
-__global__ void kernelRenderCircles(int *circle_indices, int numTiles) {
+__global__ void kernelRenderCircles(int *circle_indices, int numTiles, int tile_size) {
 
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
@@ -441,12 +501,14 @@ __global__ void kernelRenderCircles(int *circle_indices, int numTiles) {
     float4* imgPtr = reinterpret_cast<float4*>(&cuConstRendererParams.imageData[4 * (index)]);
 
     // figure out what tile we are in
-    int tile_index = ((x / 32) + (y / 32) * (width / 32));
+    int tile_index = ((x / tile_size) + (y / tile_size) * (width / tile_size));
     //printf("Current tile is %d\t", tile_index);
     // if (tile_index == 100) 
     //     printf("TRUE\n");
     // get the index of the beginning of circle indices
     int start_circle_index = tile_index * (cuConstRendererParams.numCircles);
+    
+    float4 existingColor = *imgPtr;
     
     // iterate through all the circles that are relevant
     for (int arr_ind=start_circle_index; arr_ind<start_circle_index+cuConstRendererParams.numCircles; arr_ind++) {
@@ -476,9 +538,10 @@ __global__ void kernelRenderCircles(int *circle_indices, int numTiles) {
         float2 pc = make_float2(pixelCenterNormX, pixelCenterNormY);
         float3 pos = make_float3(px, py, pz);
 
-        shadePixel(circleIndex, pc, pos, imgPtr);
+        existingColor = shadePixel(circleIndex, pc, pos, imgPtr, existingColor);
         // imgPtr++;
     }
+    *imgPtr = existingColor;
 
 }
 
@@ -488,7 +551,7 @@ __global__ void kernelRenderCircles(int *circle_indices, int numTiles) {
 // tile and circle intersect.
 // tile index: (overall index / numCircles)
 // circle index: (overall index % numCircles)
-__global__ void kernelSetTilesToCircles(int *tiles_and_circles, int length) {
+__global__ void kernelSetTilesToCircles(int *tiles_and_circles, int length, int tile_size) {
     int overall_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (overall_index >= length) return;
     int tile_index = overall_index / cuConstRendererParams.numCircles;
@@ -503,12 +566,12 @@ __global__ void kernelSetTilesToCircles(int *tiles_and_circles, int length) {
     const float invWidth  = 1.f / cuConstRendererParams.imageWidth;
     const float invHeight = 1.f / cuConstRendererParams.imageHeight;
 
-    float boxL = static_cast<float>((tile_index % (cuConstRendererParams.imageWidth / 32)) * 32);
-    float boxR = static_cast<float>(boxL + 32);
+    float boxL = static_cast<float>((tile_index % (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
+    float boxR = static_cast<float>(boxL + tile_size);
     boxL *= invWidth;
     boxR *= invWidth;
-    float boxT = static_cast<float>((tile_index / (cuConstRendererParams.imageWidth / 32)) * 32);
-    float boxB = static_cast<float>(boxT + 32);
+    float boxT = static_cast<float>((tile_index / (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
+    float boxB = static_cast<float>(boxT + tile_size);
     boxT *= invHeight;
     boxB *= invHeight;
 
@@ -746,7 +809,13 @@ CudaRenderer::render() {
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
     int totalPixels = image->height * image->width;
-    int numTiles = totalPixels / 1024;  // we want each tile to be 32 x 32
+    int numTiles = totalPixels / 1024; 
+    int tile_size = 32;
+    if (numCircles >= 2000000) {
+        numTiles = totalPixels / 16384; // now each tile is 64 x 64
+        tile_size = 128;
+    }
+     // we want each tile to be 32 x 32
 
     // create array of tiles to circles 
     // tile index: (overall index / numCircles)
@@ -754,16 +823,34 @@ CudaRenderer::render() {
     int *tiles_and_circles;
     int total_length = numTiles * numCircles;
     cudaCheckError(cudaMalloc(&tiles_and_circles, total_length * sizeof(int)));
+    
+    // size_t free_mem, total_mem;
+    // cudaError_t err = cudaMemGetInfo(&free_mem, &total_mem);
+    // if (err != cudaSuccess) {
+    //     std::cerr << "cudaMemGetInfo failed: " << cudaGetErrorString(err) << std::endl;
+    //     return;
+    // }
+    // std::cout << "Free memory: " << (free_mem / (1024.0 * 1024.0)) << " MB\n";
+    // std::cout << "Total memory: " << (total_mem / (1024.0 * 1024.0)) << " MB\n";
+
 
     // number of blocks
     dim3 gridDim((total_length + blockDim.x - 1) / blockDim.x);
 
     // find all tiles/circles that intersect
-    kernelSetTilesToCircles<<<gridDim, blockDim>>>(tiles_and_circles, total_length);
+    kernelSetTilesToCircles<<<gridDim, blockDim>>>(tiles_and_circles, total_length, tile_size);
     cudaDeviceSynchronize();
 
     // exclusive scan for each tile
     int *scanned_tiles;
+    // err = cudaMemGetInfo(&free_mem, &total_mem);
+    // if (err != cudaSuccess) {
+    //     std::cerr << "cudaMemGetInfo failed: " << cudaGetErrorString(err) << std::endl;
+    //     return;
+    // }
+    // std::cout << "Free memory: " << (free_mem / (1024.0 * 1024.0)) << " MB\n";
+    // std::cout << "Total memory: " << (total_mem / (1024.0 * 1024.0)) << " MB\n";
+    // std::cout << "Trying to allocate " << total_length * sizeof(int) << " bytes\n";
     cudaCheckError(cudaMalloc(&scanned_tiles, total_length * sizeof(int)));
     perform_exclusive_scans(tiles_and_circles, scanned_tiles, total_length, numTiles);
 
@@ -813,7 +900,9 @@ CudaRenderer::render() {
     // for each pixel, whatever tile the pixel is in, check for every overlapping circle how to 
     // color the pixel
     dim3 gridDim_2((totalPixels + blockDim.x - 1) / blockDim.x);
-    kernelRenderCircles<<<gridDim_2, blockDim>>>(circle_indices, numTiles);
+    //if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME)
+
+    kernelRenderCircles<<<gridDim_2, blockDim>>>(circle_indices, numTiles, tile_size);
     cudaDeviceSynchronize();
     cudaFree(circle_indices);
 }
