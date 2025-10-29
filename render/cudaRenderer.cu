@@ -652,8 +652,19 @@ CudaRenderer::render() {
 
     int totalPixels = image->height * image->width;
 
+    int numTiles = totalPixels / 1024;  // we want each tile to be 32 x 32
+
+    // create array of tiles to circles 
+    // tile index: (overall index / numCircles)
+    // circle index: (overall index % numCircles)
+    bool *tiles_and_circles;
+    int total_length = numTiles * cuConstRendererParams.numCircles;
+    cudaMalloc(&tiles_and_circles, total_length);
+
     // number of blocks
-    dim3 gridDim((totalPixels + blockDim.x - 1) / blockDim.x);
+    dim3 gridDim((total_length + blockDim.x - 1) / blockDim.x);
+
+    kernelSetTilesToCircles<<<gridDim, blockDim>>>(tiles_and_circles, )
 
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
