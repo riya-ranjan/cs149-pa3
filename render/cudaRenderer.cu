@@ -26,6 +26,23 @@
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
 
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 struct GlobalConstants {
 
     SceneName sceneName;
@@ -424,18 +441,20 @@ __global__ void kernelRenderCircles(int *circle_indices, int numTiles) {
     float4* imgPtr = reinterpret_cast<float4*>(&cuConstRendererParams.imageData[4 * (index)]);
 
     // figure out what tile we are in
-    int tile_index = ((x / 32) + (y / 32) * numTiles);
-
+    int tile_index = ((x / 32) + (y / 32) * (width / 32));
+    //printf("Current tile is %d\t", tile_index);
+    // if (tile_index == 100) 
+    //     printf("TRUE\n");
     // get the index of the beginning of circle indices
     int start_circle_index = tile_index * (cuConstRendererParams.numCircles);
     
-    // iterate through all the circles
+    // iterate through all the circles that are relevant
     for (int arr_ind=start_circle_index; arr_ind<start_circle_index+cuConstRendererParams.numCircles; arr_ind++) {
 
         int circleIndex = circle_indices[arr_ind];
-        if (circleIndex == 2)
-            printf("Getting circle %d for pixel in tile %d\n", circleIndex, tile_index);
-        if (arr_ind != 0 && circleIndex == 0) break;
+        // if (circleIndex > 0 && tile_index > 0)
+        //     printf("Now drawing circle %d for pixel in tile %d", circleIndex, tile_index);
+        if (arr_ind % cuConstRendererParams.numCircles != 0 && circleIndex == 0) break;
         // params of the circle we're currently looking at
         int index3 = 3 * circleIndex;
         float px = cuConstRendererParams.position[index3];
@@ -469,32 +488,43 @@ __global__ void kernelRenderCircles(int *circle_indices, int numTiles) {
 // tile and circle intersect.
 // tile index: (overall index / numCircles)
 // circle index: (overall index % numCircles)
-__global__ void kernelSetTilesToCircles(uint8_t *tiles_and_circles, int length) {
+__global__ void kernelSetTilesToCircles(int *tiles_and_circles, int length) {
     int overall_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (overall_index >= length) return;
     int tile_index = overall_index / cuConstRendererParams.numCircles;
     int circle_index = overall_index % cuConstRendererParams.numCircles;
-    
+
     int index3 = 3 * circle_index;
     float circleX = cuConstRendererParams.position[index3];
     float circleY = cuConstRendererParams.position[index3+1];
     float circleRadius = cuConstRendererParams.radius[circle_index];
 
-    // each tile is 32 x 32
-    float boxL = (tile_index % (cuConstRendererParams.imageWidth / 32)) * 32;
-    float boxR = boxL + 32;
-    float boxT = (tile_index / (cuConstRendererParams.imageWidth / 32)) * 32;
-    float boxB = boxT + 32;
+    // each tile is 32 x 32, but we need the relative width, so use the inverse
+    const float invWidth  = 1.f / cuConstRendererParams.imageWidth;
+    const float invHeight = 1.f / cuConstRendererParams.imageHeight;
 
-    tiles_and_circles[overall_index] = 
-        static_cast<uint8_t>(circleInBoxConservative(circleX, circleY, circleRadius, boxL, boxR, boxT, boxB));
+    float boxL = static_cast<float>((tile_index % (cuConstRendererParams.imageWidth / 32)) * 32);
+    float boxR = static_cast<float>(boxL + 32);
+    boxL *= invWidth;
+    boxR *= invWidth;
+    float boxT = static_cast<float>((tile_index / (cuConstRendererParams.imageWidth / 32)) * 32);
+    float boxB = static_cast<float>(boxT + 32);
+    boxT *= invHeight;
+    boxB *= invHeight;
+
+    int circle_in_box = circleInBoxConservative(circleX, circleY, circleRadius, boxL, boxR, boxB, boxT);
+    
+    tiles_and_circles[overall_index] = circle_in_box;
+    /** if (circle_in_box == 1) {
+        printf("The circle %d is in tile %d, setting %d to %d\n", circle_index, tile_index, overall_index, tiles_and_circles[overall_index]);
+    } */
 }
 
 //kernelGetCircleIndices -- (CUDA device code)
 //
 // returns output to circle_indices that tell us which circles we care about for each tile
 // performs essentially a scatter
-__global__ void kernelGetCircleIndices(int *circle_indices, uint8_t *flags, int *scanned_tiles, int total_length) {
+__global__ void kernelGetCircleIndices(int *circle_indices, int *flags, int *scanned_tiles, int total_length) {
     int overall_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (overall_index >= total_length) return;
     int tile_index = overall_index / cuConstRendererParams.numCircles;
@@ -715,17 +745,15 @@ CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
-
     int totalPixels = image->height * image->width;
-
     int numTiles = totalPixels / 1024;  // we want each tile to be 32 x 32
 
     // create array of tiles to circles 
     // tile index: (overall index / numCircles)
     // circle index: (overall index % numCircles)
-    uint8_t *tiles_and_circles;
+    int *tiles_and_circles;
     int total_length = numTiles * numCircles;
-    cudaMalloc(&tiles_and_circles, total_length * sizeof(uint8_t));
+    cudaCheckError(cudaMalloc(&tiles_and_circles, total_length * sizeof(int)));
 
     // number of blocks
     dim3 gridDim((total_length + blockDim.x - 1) / blockDim.x);
@@ -736,34 +764,69 @@ CudaRenderer::render() {
 
     // exclusive scan for each tile
     int *scanned_tiles;
-    cudaMalloc(&scanned_tiles, total_length * sizeof(int));
+    cudaCheckError(cudaMalloc(&scanned_tiles, total_length * sizeof(int)));
     perform_exclusive_scans(tiles_and_circles, scanned_tiles, total_length, numTiles);
+
+    /**
+    std::vector<int> h_out(total_length);
+    cudaMemcpy(h_out.data(), scanned_tiles, total_length * sizeof(int), cudaMemcpyDeviceToHost);
+    */
+    // std::vector<int> flags_out(total_length);
+    // cudaMemcpy(flags_out.data(), tiles_and_circles, total_length * sizeof(int), cudaMemcpyDeviceToHost);
+    /**
+    std::cout << "Exclusive scan output:\n";
+    for (int i = 0; i < numTiles; i++) {
+        for (int j = 0; j < numCircles; j++) {
+            std::cout << h_out[i * numCircles + j] << " ";
+        }
+        std::cout << "\t";
+        for (int j = 0; j < numCircles; j++) {
+            std::cout << flags_out[i * numCircles + j] << " ";
+        }
+        std::cout << std::endl;
+    }*/
 
     // get all the correct circle indices using the flags, and our exclusive scan
     int *circle_indices;
-    cudaMalloc(&circle_indices, total_length * sizeof(int));
+    cudaCheckError(cudaMalloc(&circle_indices, total_length * sizeof(int)));
     cudaMemset(circle_indices, 0, total_length * sizeof(int));
     kernelGetCircleIndices<<<gridDim, blockDim>>>(circle_indices, tiles_and_circles, scanned_tiles, total_length);
     cudaDeviceSynchronize();
+    // std::vector<int> circle_indices_out(total_length);
+    // cudaMemcpy(circle_indices_out.data(), circle_indices, total_length * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // std::cout << "Exclusive scan output:\n";
+    // for (int i = 0; i < numTiles; i++) {
+    //     for (int j = 0; j < numCircles; j++) {
+    //         std::cout << circle_indices_out[i * numCircles + j] << " ";
+    //     }
+    //     std::cout << "\t";
+    //     for (int j = 0; j < numCircles; j++) {
+    //         std::cout << flags_out[i * numCircles + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+
     cudaFree(tiles_and_circles);
     cudaFree(scanned_tiles);
 
     // for each pixel, whatever tile the pixel is in, check for every overlapping circle how to 
     // color the pixel
-    kernelRenderCircles<<<gridDim, blockDim>>>(circle_indices, numTiles);
+    dim3 gridDim_2((totalPixels + blockDim.x - 1) / blockDim.x);
+    kernelRenderCircles<<<gridDim_2, blockDim>>>(circle_indices, numTiles);
     cudaDeviceSynchronize();
     cudaFree(circle_indices);
 }
 
 void
-CudaRenderer::perform_exclusive_scans(uint8_t *flags, int *output, int length, int numTiles) {
+CudaRenderer::perform_exclusive_scans(int *flags, int *output, int length, int numTiles) {
     thrust::device_vector<int> keys(length);
     thrust::sequence(keys.begin(), keys.end());
     thrust::transform(keys.begin(), keys.end(), keys.begin(), RowID{numCircles});
 
-    thrust::device_ptr<uint8_t> in_ptr(flags);
+    thrust::device_ptr<int> in_ptr(flags);
     thrust::device_ptr<int>     out_ptr(output);
-    thrust::exclusive_scan_by_key(keys.begin(), keys.end(), in_ptr, out_ptr, 0, thrust::equal_to<int>(), thrust::plus<int>());
+    thrust::exclusive_scan_by_key(keys.begin(), keys.end(), in_ptr, out_ptr);
     cudaDeviceSynchronize();
 }
 
