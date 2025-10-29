@@ -472,12 +472,25 @@ shadePixelSnowflake(int circleIndex, float2 pixelCenter, float3 p, float4* image
     // END SHOULD-BE-ATOMIC REGION
 }
 
+struct ShadePixel {
+    __device__ float4 operator()(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float4 existingColor) const {
+        return shadePixel(circleIndex, pixelCenter, p, imagePtr, existingColor);
+    }
+};
+
+struct ShadePixelSnowflake {
+    __device__ float4 operator()(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float4 existingColor) const {
+        return shadePixelSnowflake(circleIndex, pixelCenter, p, imagePtr, existingColor);
+    }
+};
+
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
-__global__ void kernelRenderCircles(int *circle_indices, int numTiles, int tile_size) {
+template <typename ShadeFunc>
+__global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int numTiles, int tile_size) {
 
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
@@ -538,7 +551,7 @@ __global__ void kernelRenderCircles(int *circle_indices, int numTiles, int tile_
         float2 pc = make_float2(pixelCenterNormX, pixelCenterNormY);
         float3 pos = make_float3(px, py, pz);
 
-        existingColor = shadePixel(circleIndex, pc, pos, imgPtr, existingColor);
+        existingColor = shade(circleIndex, pc, pos, imgPtr, existingColor);
         // imgPtr++;
     }
     *imgPtr = existingColor;
@@ -900,9 +913,12 @@ CudaRenderer::render() {
     // for each pixel, whatever tile the pixel is in, check for every overlapping circle how to 
     // color the pixel
     dim3 gridDim_2((totalPixels + blockDim.x - 1) / blockDim.x);
-    //if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME)
-
-    kernelRenderCircles<<<gridDim_2, blockDim>>>(circle_indices, numTiles, tile_size);
+    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixelSnowflake(), circle_indices, numTiles, tile_size);
+    }
+    else {
+        kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixel(), circle_indices, numTiles, tile_size);
+    }
     cudaDeviceSynchronize();
     cudaFree(circle_indices);
 }
