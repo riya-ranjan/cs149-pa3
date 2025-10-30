@@ -643,7 +643,7 @@ boxCircleIntersect(int tile_index, int circle_index, int tile_size) {
 // 1) flag which circles belong to each tile
 // 2) perform an exclusive scan 
 // 3) map the circle indices we care about to global memory
-__global__ void kernelMapCircleIds(int *circle_indices, int total_length, int circles_pow_2, int tile_size) {
+__global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int tile_size) {
     const uint BLOCKSIZE = 256;
     int tile_index = blockIdx.x;
     int in_block_tid = threadIdx.x;
@@ -655,9 +655,9 @@ __global__ void kernelMapCircleIds(int *circle_indices, int total_length, int ci
     for (int i = in_block_tid; i < circles_pow_2; i += blockDim.x) {
         // set flags appropriately
         if (i >= cuConstRendererParams.numCircles) {
-            flags[i] = 0;
+            flags[in_block_tid] = 0;
         } else {
-            flags[i] = boxCircleIntersect(tile_index, i, tile_size);
+            flags[in_block_tid] = boxCircleIntersect(tile_index, i, tile_size);
         }
 
         __syncthreads();
@@ -666,11 +666,12 @@ __global__ void kernelMapCircleIds(int *circle_indices, int total_length, int ci
         __syncthreads();
 
         // write to global memory
-        if (flags[i]) {
+        if (flags[in_block_tid]) {
             int current_row_index = tile_index * cuConstRendererParams.numCircles;
             circle_indices[prefix_sum_output[in_block_tid] + prev_prefix_sum + current_row_index] = i;
         }
         if (in_block_tid == 0) prev_prefix_sum += prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1];
+        __syncthreads();
     }
 }
 
@@ -895,32 +896,35 @@ CudaRenderer::render() {
     // create array of tiles to circles 
     // tile index: block index
     // circle index: thread index 
-    int *tiles_and_circles;
-    int total_length = numTiles * numCircles;
-    cudaCheckError(cudaMalloc(&tiles_and_circles, total_length * sizeof(int)));
+    // int *tiles_and_circles;
+    // int total_length = numTiles * numCircles;
+    // cudaCheckError(cudaMalloc(&tiles_and_circles, total_length * sizeof(int)));
     
     // number of blocks should be = number of tiles
     // number of threads should be 256
     dim3 blockDim(256, 1);
-    dim3 gridDim((total_length + blockDim.x - 1) / blockDim.x);
+    dim3 gridDim(numTiles);
+    // dim3 gridDim((total_length + blockDim.x - 1) / blockDim.x);
 
     // find all tiles/circles that intersect
-    kernelSetTilesToCircles<<<gridDim, blockDim>>>(tiles_and_circles, total_length, tile_size);
-    cudaDeviceSynchronize();
+    // kernelSetTilesToCircles<<<gridDim, blockDim>>>(tiles_and_circles, total_length, tile_size);
+    // cudaDeviceSynchronize();
 
     // exclusive scan for each tile
-    int *scanned_tiles;
-    cudaCheckError(cudaMalloc(&scanned_tiles, total_length * sizeof(int)));
-    perform_exclusive_scans(tiles_and_circles, scanned_tiles, total_length, numTiles);
+    // int *scanned_tiles;
+    // cudaCheckError(cudaMalloc(&scanned_tiles, total_length * sizeof(int)));
+    // perform_exclusive_scans(tiles_and_circles, scanned_tiles, total_length, numTiles);
 
     // get all the correct circle indices using the flags, and our exclusive scan
     int *circle_indices;
+    int total_length = numTiles * numCircles;
     cudaCheckError(cudaMalloc(&circle_indices, total_length * sizeof(int)));
     cudaMemset(circle_indices, 0, total_length * sizeof(int));
-    kernelGetCircleIndices<<<gridDim, blockDim>>>(circle_indices, tiles_and_circles, scanned_tiles, total_length);
-    cudaDeviceSynchronize();
-    cudaFree(tiles_and_circles);
-    cudaFree(scanned_tiles);
+    // kernelGetCircleIndices<<<gridDim, blockDim>>>(circle_indices, tiles_and_circles, scanned_tiles, total_length);
+    // cudaDeviceSynchronize();
+    // cudaFree(tiles_and_circles);
+    // cudaFree(scanned_tiles);
+    kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size);
 
     // for each pixel, whatever tile the pixel is in, check for every overlapping circle how to 
     // color the pixel
