@@ -1,5 +1,5 @@
 Rendering to 1024x1024 image
-Loaded scene with 10000 circles
+Loaded scene with 2000000 circles
 ---------------------------------------------------------
 Initializing CUDA for CudaRenderer
 Found 1 CUDA devices
@@ -21,10 +21,10 @@ Copying image data from device
 Wrote image file logs/output_0002.ppm
 Copying image data from device
 Wrote image file logs/output_0003.ppm
-Clear:    0.1071 ms
-Advance:  0.0021 ms
-Render:   15.1996 ms
-Total:    15.3088 ms
-File IO:  87.4388 ms
+Clear:    0.1103 ms
+Advance:  0.0019 ms
+Render:   442.1791 ms
+Total:    442.2913 ms
+File IO:  89.0449 ms
 
-Overall:  0.4110 sec (note units are seconds)
+Overall:  2.1253 sec (note units are seconds)

@@ -563,7 +563,7 @@ boxCircleIntersect(int tile_index, int circle_index, int tile_size) {
 // draw each pixel
 template <typename ShadeFunc>
 __device__ __inline__ void
-drawPixel(ShadeFunc shade, int x, int y, int tile_index, int *circle_indices) {
+drawPixel(ShadeFunc shade, int x, int y, int tile_index, int *circle_indices, int num_circles_seen) {
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
     float invWidth = 1.f / width;
@@ -577,37 +577,34 @@ drawPixel(ShadeFunc shade, int x, int y, int tile_index, int *circle_indices) {
     // figure out what tile we are in
     int start_circle_index = tile_index * (cuConstRendererParams.numCircles);
     float4 existingColor = *imgPtr;
-    
-    // iterate through all the circles that are relevant
-    for (int arr_ind = start_circle_index; arr_ind < start_circle_index+cuConstRendererParams.numCircles; arr_ind++) {
 
-        int circleIndex = circle_indices[arr_ind];
-        if (arr_ind % cuConstRendererParams.numCircles != 0 && circleIndex == 0) break;
-        // params of the circle we're currently looking at
+    for (int k = 0; k < num_circles_seen; ++k) {
+        int circleIndex = circle_indices[k];
+
+        // circleIndex is a real index now; don't break on 0
+
         int index3 = 3 * circleIndex;
-        float px = cuConstRendererParams.position[index3];
-        float py = cuConstRendererParams.position[index3+1];
-        float pz = cuConstRendererParams.position[index3+2];
+        float px  = cuConstRendererParams.position[index3];
+        float py  = cuConstRendererParams.position[index3 + 1];
+        float pz  = cuConstRendererParams.position[index3 + 2];
         float rad = cuConstRendererParams.radius[circleIndex];
 
-        // compute the bounding box of the circle.  This bounding box
-        // is in normalized coordinates
         float minX = px - rad;
         float maxX = px + rad;
         float minY = py - rad;
         float maxY = py + rad;
 
-        // do nothing if the current pixel is not within the bounding box
-        // if (pixelCenterNormY > 0.5)
-        //     printf("Pixel norm is:%.2f, %.2f\n", pixelCenterNormX, pixelCenterNormY);
-        if (pixelCenterNormX < minX || pixelCenterNormX > maxX || minY > pixelCenterNormY || maxY <  pixelCenterNormY)  continue;
-        
-        // printf("Now shading pixel inside tile %d", tile_index);
-        float2 pc = make_float2(pixelCenterNormX, pixelCenterNormY);
+        if (pixelCenterNormX < minX || pixelCenterNormX > maxX ||
+            pixelCenterNormY < minY || pixelCenterNormY > maxY) {
+            continue;
+        }
+
+        float2 pc  = make_float2(pixelCenterNormX, pixelCenterNormY);
         float3 pos = make_float3(px, py, pz);
 
         existingColor = shade(circleIndex, pc, pos, imgPtr, existingColor);
     }
+
     *imgPtr = existingColor;
 }
 
@@ -619,56 +616,65 @@ drawPixel(ShadeFunc shade, int x, int y, int tile_index, int *circle_indices) {
 // 3) map the circle indices we care about to global memory
 template <typename ShadeFunc>
 __global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int tile_size, ShadeFunc shade) {
-    const uint BLOCKSIZE = 256;
+    const uint BLOCKSIZE = 256; // change back to 256 if bad
     int tile_index = blockIdx.x;
-    int in_block_tid = threadIdx.x;
+    int in_block_tid = threadIdx.x; // thread index within the block -> circle being tested. 
 
-    __shared__ uint flags[BLOCKSIZE];
-    __shared__ uint prefix_sum_output[BLOCKSIZE];
-    __shared__ uint prefix_sum_scratch[2 * BLOCKSIZE];
-    __shared__ int prev_prefix_sum;
+    // shared memory
+    __shared__ uint flags[BLOCKSIZE];                    // for this block of up to 256 cicles, each thread will mark 0/1 (did the circle i represent intersect this tile)
+    __shared__ uint prefix_sum_output[BLOCKSIZE];        // result of exclusive scan on flags -> give each thread it's pos in output array of circes we care about
+    __shared__ uint prefix_sum_scratch[2 * BLOCKSIZE];   // buffer
+    __shared__ int prev_prefix_sum;                      // how many circles we alr wrote for this tile in prev batches
+
+    __shared__ int running_count;                        // number of circles we've seen for this tile so far
+    __shared__ int shared_circle_indices[BLOCKSIZE];     // we are only checking BLOCKSIZE circles rn anyway
 
     if (in_block_tid == 0) {
         prev_prefix_sum = 0;
+        running_count = 0;
     }
     __syncthreads();
 
+    // loop through the circles, check each blockDimxth circle
     for (int i = in_block_tid; i < circles_pow_2; i += blockDim.x) {
         // set flags appropriately
-        if (i >= cuConstRendererParams.numCircles) {
+
+        if (i >= cuConstRendererParams.numCircles) { // take care of the extra circles bc we round up
             flags[in_block_tid] = 0;
         } else {
             flags[in_block_tid] = boxCircleIntersect(tile_index, i, tile_size);
         }
-
         __syncthreads();
-        // perform prefix scans
+
+        // perform prefix scans -> write to sum_output
         sharedMemExclusiveScan(in_block_tid, flags, prefix_sum_output, prefix_sum_scratch, BLOCKSIZE);
         __syncthreads();
 
-        // write to global memory
-        if (flags[in_block_tid] == 1) {
-            int current_row_index = tile_index * cuConstRendererParams.numCircles;
-            circle_indices[prefix_sum_output[in_block_tid] + prev_prefix_sum + current_row_index] = i;
+        // scatter. ugh
+        if (flags[in_block_tid] == 1) { 
+            shared_circle_indices[prefix_sum_output[in_block_tid] + running_count] = i;
         }
-        __syncthreads();
+
+        // update total for next barch
         if (in_block_tid == 0) {
-            prev_prefix_sum += (prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1]);
+            // prev_prefix_sum += (prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1]);
+            running_count += (prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1]);
         }
         __syncthreads();
     }
 
-    /**  */
-    int tile_left_edge = (tile_index % (cuConstRendererParams.imageWidth / tile_size)) * tile_size;
-    int tile_top_edge = (tile_index / (cuConstRendererParams.imageWidth / tile_size)) * tile_size;
-    //__syncthreads();
+    // every thread knows that shared_circle_indices[0 .. running_count - 1] are valid
+    // we can shade the pixels now
+    int tiles_per_row = cuConstRendererParams.imageWidth / tile_size;
+    int tile_left_edge = (tile_index % tiles_per_row) * tile_size;
+    int tile_top_edge = (tile_index / tiles_per_row) * tile_size;
 
     for (int i = in_block_tid; i < tile_size * tile_size; i += blockDim.x ) {
-        int pixel_id_x = (i % 64) + tile_left_edge;
-        int pixel_id_y = (i / 64) + tile_top_edge;
+        int pixel_id_x = (i % tile_size) + tile_left_edge;
+        int pixel_id_y = (i / tile_size) + tile_top_edge;
         // if (pixel_id_y > 512)
         //     printf("Y coord of pixel is %d\n", pixel_id_y);
-        drawPixel(shade, pixel_id_x, pixel_id_y, tile_index, circle_indices);
+        drawPixel(shade, pixel_id_x, pixel_id_y, tile_index, shared_circle_indices, running_count);
     }
 }
 
