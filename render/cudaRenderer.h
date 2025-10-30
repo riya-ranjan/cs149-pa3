@@ -40,6 +40,17 @@ class CudaRenderer : public CircleRenderer {
 
   void perform_exclusive_scans(int *flags, int *output, int length, int numTiles);
 
+  int nextPow2(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+  }
+
   void shadePixel(int circleIndex, float pixelCenterX, float pixelCenterY,
                   float px, float py, float pz, float* pixelData);
 };

@@ -15,6 +15,9 @@
 #include "util.h"
 #include "circleBoxTest.cu_inl"
 
+#define SCAN_BLOCK_DIM   256
+#include "exclusiveScan.cu_inl"
+
 #include <thrust/device_ptr.h>    
 #include <thrust/device_vector.h> 
 #include <thrust/sequence.h>       
@@ -375,24 +378,24 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, floa
     // would be wise to perform this logic outside of the loop next in
     // kernelRenderCircles.  (If feeling good about yourself, you
     // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+    // if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
 
-        const float kCircleMaxAlpha = .5f;
-        const float falloffScale = 4.f;
+    //     const float kCircleMaxAlpha = .5f;
+    //     const float falloffScale = 4.f;
 
-        float normPixelDist = sqrt(pixelDist) / rad;
-        rgb = lookupColor(normPixelDist);
+    //     float normPixelDist = sqrt(pixelDist) / rad;
+    //     rgb = lookupColor(normPixelDist);
 
-        float maxAlpha = .6f + .4f * (1.f-p.z);
-        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
-        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+    //     float maxAlpha = .6f + .4f * (1.f-p.z);
+    //     maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+    //     alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
-    } else {
-        // simple: each circle has an assigned color
+    // } else {
+    //     // simple: each circle has an assigned color
         int index3 = 3 * circleIndex;
         rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
-    }
+    // }
 
     float oneMinusAlpha = 1.f - alpha;
 
@@ -610,6 +613,67 @@ __global__ void kernelGetCircleIndices(int *circle_indices, int *flags, int *sca
     }
 }
 
+// returns whether or not the circle intersects with the
+// tile at the specified tile index
+__device__ __inline__ int
+boxCircleIntersect(int tile_index, int circle_index, int tile_size) {
+    int index3 = 3 * circle_index;
+    float circleX = cuConstRendererParams.position[index3];
+    float circleY = cuConstRendererParams.position[index3+1];
+    float circleRadius = cuConstRendererParams.radius[circle_index];
+
+    const float invWidth  = 1.f / cuConstRendererParams.imageWidth;
+    const float invHeight = 1.f / cuConstRendererParams.imageHeight;
+
+    float boxL = static_cast<float>((tile_index % (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
+    float boxR = static_cast<float>(boxL + tile_size);
+    boxL *= invWidth;
+    boxR *= invWidth;
+    float boxT = static_cast<float>((tile_index / (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
+    float boxB = static_cast<float>(boxT + tile_size);
+    boxT *= invHeight;
+    boxB *= invHeight;
+
+    return circleInBoxConservative(circleX, circleY, circleRadius, boxL, boxR, boxB, boxT);
+}
+
+//kernelMapCircleIds -- (CUDA device code)
+//
+// This will be a single kernel where we:
+// 1) flag which circles belong to each tile
+// 2) perform an exclusive scan 
+// 3) map the circle indices we care about to global memory
+__global__ void kernelMapCircleIds(int *circle_indices, int total_length, int circles_pow_2, int tile_size) {
+    const uint BLOCKSIZE = 256;
+    int tile_index = blockIdx.x;
+    int in_block_tid = threadIdx.x;
+
+    __shared__ uint flags[BLOCKSIZE];
+    __shared__ uint prefix_sum_output[BLOCKSIZE];
+    __shared__ uint prefix_sum_scratch[2 * BLOCKSIZE];
+    int prev_prefix_sum = 0;
+    for (int i = in_block_tid; i < circles_pow_2; i += blockDim.x) {
+        // set flags appropriately
+        if (i >= cuConstRendererParams.numCircles) {
+            flags[i] = 0;
+        } else {
+            flags[i] = boxCircleIntersect(tile_index, i, tile_size);
+        }
+
+        __syncthreads();
+        // perform prefix scans
+        sharedMemExclusiveScan(in_block_tid, flags, prefix_sum_output, prefix_sum_scratch, BLOCKSIZE);
+        __syncthreads();
+
+        // write to global memory
+        if (flags[i]) {
+            int current_row_index = tile_index * cuConstRendererParams.numCircles;
+            circle_indices[prefix_sum_output[in_block_tid] + prev_prefix_sum + current_row_index] = i;
+        }
+        if (in_block_tid == 0) prev_prefix_sum += prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1];
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -818,36 +882,26 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
     int totalPixels = image->height * image->width;
+
+    // we want each tile to be 32 x 32, unless the image is too big
     int numTiles = totalPixels / 1024; 
     int tile_size = 32;
     if (numCircles >= 2000000) {
         numTiles = totalPixels / 16384; // now each tile is 64 x 64
         tile_size = 128;
     }
-     // we want each tile to be 32 x 32
 
     // create array of tiles to circles 
-    // tile index: (overall index / numCircles)
-    // circle index: (overall index % numCircles)
+    // tile index: block index
+    // circle index: thread index 
     int *tiles_and_circles;
     int total_length = numTiles * numCircles;
     cudaCheckError(cudaMalloc(&tiles_and_circles, total_length * sizeof(int)));
     
-    // size_t free_mem, total_mem;
-    // cudaError_t err = cudaMemGetInfo(&free_mem, &total_mem);
-    // if (err != cudaSuccess) {
-    //     std::cerr << "cudaMemGetInfo failed: " << cudaGetErrorString(err) << std::endl;
-    //     return;
-    // }
-    // std::cout << "Free memory: " << (free_mem / (1024.0 * 1024.0)) << " MB\n";
-    // std::cout << "Total memory: " << (total_mem / (1024.0 * 1024.0)) << " MB\n";
-
-
-    // number of blocks
+    // number of blocks should be = number of tiles
+    // number of threads should be 256
+    dim3 blockDim(256, 1);
     dim3 gridDim((total_length + blockDim.x - 1) / blockDim.x);
 
     // find all tiles/circles that intersect
@@ -856,35 +910,8 @@ CudaRenderer::render() {
 
     // exclusive scan for each tile
     int *scanned_tiles;
-    // err = cudaMemGetInfo(&free_mem, &total_mem);
-    // if (err != cudaSuccess) {
-    //     std::cerr << "cudaMemGetInfo failed: " << cudaGetErrorString(err) << std::endl;
-    //     return;
-    // }
-    // std::cout << "Free memory: " << (free_mem / (1024.0 * 1024.0)) << " MB\n";
-    // std::cout << "Total memory: " << (total_mem / (1024.0 * 1024.0)) << " MB\n";
-    // std::cout << "Trying to allocate " << total_length * sizeof(int) << " bytes\n";
     cudaCheckError(cudaMalloc(&scanned_tiles, total_length * sizeof(int)));
     perform_exclusive_scans(tiles_and_circles, scanned_tiles, total_length, numTiles);
-
-    /**
-    std::vector<int> h_out(total_length);
-    cudaMemcpy(h_out.data(), scanned_tiles, total_length * sizeof(int), cudaMemcpyDeviceToHost);
-    */
-    // std::vector<int> flags_out(total_length);
-    // cudaMemcpy(flags_out.data(), tiles_and_circles, total_length * sizeof(int), cudaMemcpyDeviceToHost);
-    /**
-    std::cout << "Exclusive scan output:\n";
-    for (int i = 0; i < numTiles; i++) {
-        for (int j = 0; j < numCircles; j++) {
-            std::cout << h_out[i * numCircles + j] << " ";
-        }
-        std::cout << "\t";
-        for (int j = 0; j < numCircles; j++) {
-            std::cout << flags_out[i * numCircles + j] << " ";
-        }
-        std::cout << std::endl;
-    }*/
 
     // get all the correct circle indices using the flags, and our exclusive scan
     int *circle_indices;
@@ -892,21 +919,6 @@ CudaRenderer::render() {
     cudaMemset(circle_indices, 0, total_length * sizeof(int));
     kernelGetCircleIndices<<<gridDim, blockDim>>>(circle_indices, tiles_and_circles, scanned_tiles, total_length);
     cudaDeviceSynchronize();
-    // std::vector<int> circle_indices_out(total_length);
-    // cudaMemcpy(circle_indices_out.data(), circle_indices, total_length * sizeof(int), cudaMemcpyDeviceToHost);
-
-    // std::cout << "Exclusive scan output:\n";
-    // for (int i = 0; i < numTiles; i++) {
-    //     for (int j = 0; j < numCircles; j++) {
-    //         std::cout << circle_indices_out[i * numCircles + j] << " ";
-    //     }
-    //     std::cout << "\t";
-    //     for (int j = 0; j < numCircles; j++) {
-    //         std::cout << flags_out[i * numCircles + j] << " ";
-    //     }
-    //     std::cout << std::endl;
-    // }
-
     cudaFree(tiles_and_circles);
     cudaFree(scanned_tiles);
 
