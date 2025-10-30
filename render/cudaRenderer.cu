@@ -490,7 +490,6 @@ __global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int nu
     // so we can match it to the other circles
     int x = index % width;
     int y = index / width;
-    // printf("this has coordinates (%d, %d)\n", x, y);
 
     float invWidth = 1.f / width;
     float invHeight = 1.f / height;
@@ -502,10 +501,6 @@ __global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int nu
 
     // figure out what tile we are in
     int tile_index = ((x / tile_size) + (y / tile_size) * (width / tile_size));
-    //printf("Current tile is %d\t", tile_index);
-    // if (tile_index == 100) 
-    //     printf("TRUE\n");
-    // get the index of the beginning of circle indices
     int start_circle_index = tile_index * (cuConstRendererParams.numCircles);
     
     float4 existingColor = *imgPtr;
@@ -565,13 +560,65 @@ boxCircleIntersect(int tile_index, int circle_index, int tile_size) {
     return circleInBox(circleX, circleY, circleRadius, boxL, boxR, boxB, boxT);
 }
 
+// draw each pixel
+template <typename ShadeFunc>
+__device__ __inline__ void
+drawPixel(ShadeFunc shade, int x, int y, int tile_index, int *circle_indices) {
+    int width = cuConstRendererParams.imageWidth;
+    int height = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / width;
+    float invHeight = 1.f / height;
+    float pixelCenterNormX = invWidth  * (static_cast<float>(x) + 0.5f);
+    float pixelCenterNormY = invHeight * (static_cast<float>(y) + 0.5f);
+
+    // pointer to this pixels RGBA in global image
+    float4* imgPtr = reinterpret_cast<float4*>(&cuConstRendererParams.imageData[4 * (y * width + x)]);
+
+    // figure out what tile we are in
+    int start_circle_index = tile_index * (cuConstRendererParams.numCircles);
+    float4 existingColor = *imgPtr;
+    
+    // iterate through all the circles that are relevant
+    for (int arr_ind = start_circle_index; arr_ind < start_circle_index+cuConstRendererParams.numCircles; arr_ind++) {
+
+        int circleIndex = circle_indices[arr_ind];
+        if (arr_ind % cuConstRendererParams.numCircles != 0 && circleIndex == 0) break;
+        // params of the circle we're currently looking at
+        int index3 = 3 * circleIndex;
+        float px = cuConstRendererParams.position[index3];
+        float py = cuConstRendererParams.position[index3+1];
+        float pz = cuConstRendererParams.position[index3+2];
+        float rad = cuConstRendererParams.radius[circleIndex];
+
+        // compute the bounding box of the circle.  This bounding box
+        // is in normalized coordinates
+        float minX = px - rad;
+        float maxX = px + rad;
+        float minY = py - rad;
+        float maxY = py + rad;
+
+        // do nothing if the current pixel is not within the bounding box
+        // if (pixelCenterNormY > 0.5)
+        //     printf("Pixel norm is:%.2f, %.2f\n", pixelCenterNormX, pixelCenterNormY);
+        if (pixelCenterNormX < minX || pixelCenterNormX > maxX || minY > pixelCenterNormY || maxY <  pixelCenterNormY)  continue;
+        
+        // printf("Now shading pixel inside tile %d", tile_index);
+        float2 pc = make_float2(pixelCenterNormX, pixelCenterNormY);
+        float3 pos = make_float3(px, py, pz);
+
+        existingColor = shade(circleIndex, pc, pos, imgPtr, existingColor);
+    }
+    *imgPtr = existingColor;
+}
+
 //kernelMapCircleIds -- (CUDA device code)
 //
 // This will be a single kernel where we:
 // 1) flag which circles belong to each tile
 // 2) perform an exclusive scan 
 // 3) map the circle indices we care about to global memory
-__global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int tile_size) {
+template <typename ShadeFunc>
+__global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int tile_size, ShadeFunc shade) {
     const uint BLOCKSIZE = 256;
     int tile_index = blockIdx.x;
     int in_block_tid = threadIdx.x;
@@ -609,6 +656,19 @@ __global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int t
             prev_prefix_sum += (prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1]);
         }
         __syncthreads();
+    }
+
+    /**  */
+    int tile_left_edge = (tile_index % (cuConstRendererParams.imageWidth / tile_size)) * tile_size;
+    int tile_top_edge = (tile_index / (cuConstRendererParams.imageWidth / tile_size)) * tile_size;
+    //__syncthreads();
+
+    for (int i = in_block_tid; i < tile_size * tile_size; i += blockDim.x ) {
+        int pixel_id_x = (i % 64) + tile_left_edge;
+        int pixel_id_y = (i / 64) + tile_top_edge;
+        // if (pixel_id_y > 512)
+        //     printf("Y coord of pixel is %d\n", pixel_id_y);
+        drawPixel(shade, pixel_id_x, pixel_id_y, tile_index, circle_indices);
     }
 }
 
@@ -840,16 +900,20 @@ CudaRenderer::render() {
     dim3 gridDim(numTiles);
 
     /** run kernel to map tile->circle_index */
-    kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size);
+    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size, ShadePixelSnowflake());
+    } else {
+        kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size, ShadePixel());
+    }
     cudaDeviceSynchronize();
 
     /** parallelize across pixels */
-    dim3 gridDim_2((totalPixels + blockDim.x - 1) / blockDim.x);
-    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
-        kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixelSnowflake(), circle_indices, numTiles, tile_size);
-    } else {
-        kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixel(), circle_indices, numTiles, tile_size);
-    }
-    cudaDeviceSynchronize();
+    // dim3 gridDim_2((totalPixels + blockDim.x - 1) / blockDim.x);
+    // if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
+    //     kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixelSnowflake(), circle_indices, numTiles, tile_size);
+    // } else {
+    //     kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixel(), circle_indices, numTiles, tile_size);
+    // }
+    // cudaDeviceSynchronize();
 }
 
