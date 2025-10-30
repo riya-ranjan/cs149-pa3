@@ -439,13 +439,6 @@ shadePixelSnowflake(int circleIndex, float2 pixelCenter, float3 p, float4* image
     float alpha;
 
     // there is a non-zero contribution.  Now compute the shading value
-
-    // suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks etc to implement the conditional.  It
-    // would be wise to perform this logic outside of the loop next in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
     const float kCircleMaxAlpha = .5f;
     const float falloffScale = 4.f;
 
@@ -458,21 +451,12 @@ shadePixelSnowflake(int circleIndex, float2 pixelCenter, float3 p, float4* image
 
     float oneMinusAlpha = 1.f - alpha;
 
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
-
-    //float4 existingColor = *imagePtr;
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
     return newColor;
-
-    // global memory write
-    //*imagePtr = newColor;
-
-    // END SHOULD-BE-ATOMIC REGION
 }
 
 struct ShadePixel {
@@ -530,8 +514,7 @@ __global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int nu
     for (int arr_ind=start_circle_index; arr_ind<start_circle_index+cuConstRendererParams.numCircles; arr_ind++) {
 
         int circleIndex = circle_indices[arr_ind];
-        // if (circleIndex > 0 && tile_index > 0)
-        //     printf("Now drawing circle %d for pixel in tile %d", circleIndex, tile_index);
+        
         if (arr_ind % cuConstRendererParams.numCircles != 0 && circleIndex == 0) break;
         // params of the circle we're currently looking at
         int index3 = 3 * circleIndex;
@@ -550,15 +533,12 @@ __global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int nu
         // do nothing if the current pixel is not within the bounding box
         if (pixelCenterNormX < minX || pixelCenterNormX > maxX || minY > pixelCenterNormY || maxY <  pixelCenterNormY)  continue;
         
-        //printf("the circle index %d has been detected\n", circleIndex);
         float2 pc = make_float2(pixelCenterNormX, pixelCenterNormY);
         float3 pos = make_float3(px, py, pz);
 
         existingColor = shade(circleIndex, pc, pos, imgPtr, existingColor);
-        // imgPtr++;
     }
     *imgPtr = existingColor;
-
 }
 
 // returns whether or not the circle intersects with the
@@ -671,6 +651,7 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
     }
+    cudaFree(circle_indices);
 }
 
 const Image*
@@ -735,6 +716,14 @@ CudaRenderer::setup() {
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
+
+    /** allocate the memory for storing our circle indices */
+    int totalPixels = image->height * image->width;
+    // we want each tile to be 64 x 64, unless the image is too big
+    int numTiles = totalPixels / 4096; 
+    int total_length = numTiles * numCircles;
+    cudaCheckError(cudaMalloc(&circle_indices, total_length * sizeof(int)));
+    cudaMemset(circle_indices, 0, total_length * sizeof(int));
 
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
@@ -846,12 +835,6 @@ CudaRenderer::render() {
     int numTiles = totalPixels / 4096; 
     int tile_size = 64;
 
-    /** allocate memory needed to store our tile->circle_index map */
-    int *circle_indices;
-    int total_length = numTiles * numCircles;
-    cudaCheckError(cudaMalloc(&circle_indices, total_length * sizeof(int)));
-    cudaMemset(circle_indices, 0, total_length * sizeof(int));
-
     /** formally create block dimensions */
     dim3 blockDim(256, 1);
     dim3 gridDim(numTiles);
@@ -868,6 +851,5 @@ CudaRenderer::render() {
         kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixel(), circle_indices, numTiles, tile_size);
     }
     cudaDeviceSynchronize();
-    cudaFree(circle_indices);
 }
 
