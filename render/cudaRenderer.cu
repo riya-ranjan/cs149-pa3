@@ -582,7 +582,7 @@ boxCircleIntersect(int tile_index, int circle_index, int tile_size) {
     boxT *= invHeight;
     boxB *= invHeight;
 
-    return circleInBoxConservative(circleX, circleY, circleRadius, boxL, boxR, boxB, boxT);
+    return circleInBox(circleX, circleY, circleRadius, boxL, boxR, boxB, boxT);
 }
 
 //kernelMapCircleIds -- (CUDA device code)
@@ -842,13 +842,9 @@ void
 CudaRenderer::render() {
     int totalPixels = image->height * image->width;
 
-    // we want each tile to be 32 x 32, unless the image is too big
-    int numTiles = totalPixels / 1024; 
-    int tile_size = 32;
-    if (numCircles >= 2000000) {
-        numTiles = totalPixels / 16384; // now each tile is 128 x 128
-        tile_size = 128;
-    }
+    // we want each tile to be 64 x 64, unless the image is too big
+    int numTiles = totalPixels / 4096; 
+    int tile_size = 64;
 
     /** allocate memory needed to store our tile->circle_index map */
     int *circle_indices;

@@ -21,10 +21,10 @@ Copying image data from device
 Wrote image file logs/output_0002.ppm
 Copying image data from device
 Wrote image file logs/output_0003.ppm
-Clear:    0.1089 ms
-Advance:  0.0020 ms
-Render:   438.7665 ms
-Total:    438.8774 ms
-File IO:  89.1161 ms
+Clear:    0.1065 ms
+Advance:  0.0019 ms
+Render:   441.6979 ms
+Total:    441.8063 ms
+File IO:  87.8200 ms
 
-Overall:  2.1120 sec (note units are seconds)
+Overall:  2.1185 sec (note units are seconds)
