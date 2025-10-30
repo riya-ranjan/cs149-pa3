@@ -561,58 +561,6 @@ __global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int nu
 
 }
 
-// kerneltSetTilesToCircles -- (CUDA device code)
-//
-// Sets the boolean index of tiles_to_circles to true if this particular
-// tile and circle intersect.
-// tile index: (overall index / numCircles)
-// circle index: (overall index % numCircles)
-__global__ void kernelSetTilesToCircles(int *tiles_and_circles, int length, int tile_size) {
-    int overall_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (overall_index >= length) return;
-    int tile_index = overall_index / cuConstRendererParams.numCircles;
-    int circle_index = overall_index % cuConstRendererParams.numCircles;
-
-    int index3 = 3 * circle_index;
-    float circleX = cuConstRendererParams.position[index3];
-    float circleY = cuConstRendererParams.position[index3+1];
-    float circleRadius = cuConstRendererParams.radius[circle_index];
-
-    // each tile is 32 x 32, but we need the relative width, so use the inverse
-    const float invWidth  = 1.f / cuConstRendererParams.imageWidth;
-    const float invHeight = 1.f / cuConstRendererParams.imageHeight;
-
-    float boxL = static_cast<float>((tile_index % (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
-    float boxR = static_cast<float>(boxL + tile_size);
-    boxL *= invWidth;
-    boxR *= invWidth;
-    float boxT = static_cast<float>((tile_index / (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
-    float boxB = static_cast<float>(boxT + tile_size);
-    boxT *= invHeight;
-    boxB *= invHeight;
-
-    int circle_in_box = circleInBoxConservative(circleX, circleY, circleRadius, boxL, boxR, boxB, boxT);
-    
-    tiles_and_circles[overall_index] = circle_in_box;
-    /** if (circle_in_box == 1) {
-        printf("The circle %d is in tile %d, setting %d to %d\n", circle_index, tile_index, overall_index, tiles_and_circles[overall_index]);
-    } */
-}
-
-//kernelGetCircleIndices -- (CUDA device code)
-//
-// returns output to circle_indices that tell us which circles we care about for each tile
-// performs essentially a scatter
-__global__ void kernelGetCircleIndices(int *circle_indices, int *flags, int *scanned_tiles, int total_length) {
-    int overall_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (overall_index >= total_length) return;
-    int tile_index = overall_index / cuConstRendererParams.numCircles;
-
-    if (flags[overall_index]) {
-        circle_indices[scanned_tiles[overall_index] + tile_index * cuConstRendererParams.numCircles] = overall_index % cuConstRendererParams.numCircles;
-    }
-}
-
 // returns whether or not the circle intersects with the
 // tile at the specified tile index
 __device__ __inline__ int
@@ -651,7 +599,13 @@ __global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int t
     __shared__ uint flags[BLOCKSIZE];
     __shared__ uint prefix_sum_output[BLOCKSIZE];
     __shared__ uint prefix_sum_scratch[2 * BLOCKSIZE];
-    int prev_prefix_sum = 0;
+    __shared__ int prev_prefix_sum;
+
+    if (in_block_tid == 0) {
+        prev_prefix_sum = 0;
+    }
+    __syncthreads();
+
     for (int i = in_block_tid; i < circles_pow_2; i += blockDim.x) {
         // set flags appropriately
         if (i >= cuConstRendererParams.numCircles) {
@@ -666,11 +620,14 @@ __global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int t
         __syncthreads();
 
         // write to global memory
-        if (flags[in_block_tid]) {
+        if (flags[in_block_tid] == 1) {
             int current_row_index = tile_index * cuConstRendererParams.numCircles;
             circle_indices[prefix_sum_output[in_block_tid] + prev_prefix_sum + current_row_index] = i;
         }
-        if (in_block_tid == 0) prev_prefix_sum += prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1];
+        __syncthreads();
+        if (in_block_tid == 0) {
+            prev_prefix_sum += (prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1]);
+        }
         __syncthreads();
     }
 }
@@ -889,66 +846,32 @@ CudaRenderer::render() {
     int numTiles = totalPixels / 1024; 
     int tile_size = 32;
     if (numCircles >= 2000000) {
-        numTiles = totalPixels / 16384; // now each tile is 64 x 64
+        numTiles = totalPixels / 16384; // now each tile is 128 x 128
         tile_size = 128;
     }
 
-    // create array of tiles to circles 
-    // tile index: block index
-    // circle index: thread index 
-    // int *tiles_and_circles;
-    // int total_length = numTiles * numCircles;
-    // cudaCheckError(cudaMalloc(&tiles_and_circles, total_length * sizeof(int)));
-    
-    // number of blocks should be = number of tiles
-    // number of threads should be 256
-    dim3 blockDim(256, 1);
-    dim3 gridDim(numTiles);
-    // dim3 gridDim((total_length + blockDim.x - 1) / blockDim.x);
-
-    // find all tiles/circles that intersect
-    // kernelSetTilesToCircles<<<gridDim, blockDim>>>(tiles_and_circles, total_length, tile_size);
-    // cudaDeviceSynchronize();
-
-    // exclusive scan for each tile
-    // int *scanned_tiles;
-    // cudaCheckError(cudaMalloc(&scanned_tiles, total_length * sizeof(int)));
-    // perform_exclusive_scans(tiles_and_circles, scanned_tiles, total_length, numTiles);
-
-    // get all the correct circle indices using the flags, and our exclusive scan
+    /** allocate memory needed to store our tile->circle_index map */
     int *circle_indices;
     int total_length = numTiles * numCircles;
     cudaCheckError(cudaMalloc(&circle_indices, total_length * sizeof(int)));
     cudaMemset(circle_indices, 0, total_length * sizeof(int));
-    // kernelGetCircleIndices<<<gridDim, blockDim>>>(circle_indices, tiles_and_circles, scanned_tiles, total_length);
-    // cudaDeviceSynchronize();
-    // cudaFree(tiles_and_circles);
-    // cudaFree(scanned_tiles);
-    kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size);
 
-    // for each pixel, whatever tile the pixel is in, check for every overlapping circle how to 
-    // color the pixel
+    /** formally create block dimensions */
+    dim3 blockDim(256, 1);
+    dim3 gridDim(numTiles);
+
+    /** run kernel to map tile->circle_index */
+    kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size);
+    cudaDeviceSynchronize();
+
+    /** parallelize across pixels */
     dim3 gridDim_2((totalPixels + blockDim.x - 1) / blockDim.x);
     if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
         kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixelSnowflake(), circle_indices, numTiles, tile_size);
-    }
-    else {
+    } else {
         kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixel(), circle_indices, numTiles, tile_size);
     }
     cudaDeviceSynchronize();
     cudaFree(circle_indices);
 }
-
-void
-CudaRenderer::perform_exclusive_scans(int *flags, int *output, int length, int numTiles) {
-    thrust::device_vector<int> keys(length);
-    thrust::sequence(keys.begin(), keys.end());
-    thrust::transform(keys.begin(), keys.end(), keys.begin(), RowID{numCircles});
-
-    thrust::device_ptr<int> in_ptr(flags);
-    thrust::device_ptr<int>     out_ptr(output);
-    thrust::exclusive_scan_by_key(keys.begin(), keys.end(), in_ptr, out_ptr);
-    cudaDeviceSynchronize();
-}
-
 

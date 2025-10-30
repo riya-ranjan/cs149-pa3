@@ -38,8 +38,6 @@ class CudaRenderer : public CircleRenderer {
 
   void render();
 
-  void perform_exclusive_scans(int *flags, int *output, int length, int numTiles);
-
   int nextPow2(int n) {
     n--;
     n |= n >> 1;
