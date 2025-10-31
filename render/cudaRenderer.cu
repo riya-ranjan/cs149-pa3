@@ -346,7 +346,7 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ float4
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float4 existingColor) {
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4 existingColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -381,7 +381,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, floa
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ float4
-shadePixelSnowflake(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float4 existingColor) {
+shadePixelSnowflake(int circleIndex, float2 pixelCenter, float3 p, float4 existingColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -419,14 +419,14 @@ shadePixelSnowflake(int circleIndex, float2 pixelCenter, float3 p, float4* image
 }
 
 struct ShadePixel {
-    __device__ float4 operator()(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float4 existingColor) const {
-        return shadePixel(circleIndex, pixelCenter, p, imagePtr, existingColor);
+    __device__ float4 operator()(int circleIndex, float2 pixelCenter, float3 p, float4 existingColor) const {
+        return shadePixel(circleIndex, pixelCenter, p, existingColor);
     }
 };
 
 struct ShadePixelSnowflake {
-    __device__ float4 operator()(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float4 existingColor) const {
-        return shadePixelSnowflake(circleIndex, pixelCenter, p, imagePtr, existingColor);
+    __device__ float4 operator()(int circleIndex, float2 pixelCenter, float3 p, float4 existingColor) const {
+        return shadePixelSnowflake(circleIndex, pixelCenter, p, existingColor);
     }
 };
 
@@ -492,7 +492,7 @@ __global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int ti
         float2 pc = make_float2(pixelCenterNormX, pixelCenterNormY);
         float3 pos = make_float3(px, py, pz);
 
-        existingColor = shade(circleIndex, pc, pos, imgPtr, existingColor);
+        existingColor = shade(circleIndex, pc, pos, existingColor);
     }
     *imgPtr = existingColor;
 }
@@ -521,27 +521,95 @@ boxCircleIntersect(int tile_index, int circle_index, int tile_size) {
     return circleInBox(circleX, circleY, circleRadius, boxL, boxR, boxB, boxT);
 }
 
+__device__ __inline__ float
+getPixelX(int tile_index, int thread_id, int tile_size) {
+    int x = (thread_id % tile_size) + ((tile_index % (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
+    float inv_width = 1.f / cuConstRendererParams.imageWidth;
+    return inv_width  * (static_cast<float>(x) + 0.5f);
+}
+
+__device__ __inline__ float
+getPixelY(int tile_index, int thread_id, int tile_size) {
+    int y = (thread_id / tile_size) + ((tile_index / (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
+    float inv_height = 1.f / cuConstRendererParams.imageHeight;
+    return inv_height * (static_cast<float>(y) + 0.5f);
+}
+
+__device__ __inline__ float4*
+getImgPtr(int tile_index, int thread_id, int tile_size) {
+    int x = (thread_id % tile_size) + ((tile_index % (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
+    int y = (thread_id / tile_size) + ((tile_index / (cuConstRendererParams.imageWidth / tile_size)) * tile_size);
+    //printf("Index %d in tile %d has coordinates (%d, %d) and overall index %d\n", thread_id, tile_index, x, y, (x + (y * cuConstRendererParams.imageWidth)));
+    return reinterpret_cast<float4*>(&cuConstRendererParams.imageData[4 * (x + (y * cuConstRendererParams.imageWidth))]);
+}
+
+template <typename ShadeFunc>
+__device__ __inline__ float4
+getNewColor(uint *circle_indices, float pixel_center_norm_x, float pixel_center_norm_y, float4 existing_color, ShadeFunc shade, int iter) {
+    // iterate through all the circles that are relevant
+    for (int i = 0; i < SCAN_BLOCK_DIM; i++) {
+
+        int circleIndex = circle_indices[i];
+        
+        if ((i != 0 && circleIndex == 0) || (iter != 0 && circleIndex == 0)) break;
+
+        // params of the circle we're currently looking at
+        int index3 = 3 * circleIndex;
+        float px = cuConstRendererParams.position[index3];
+        float py = cuConstRendererParams.position[index3+1];
+        float pz = cuConstRendererParams.position[index3+2];
+        float rad = cuConstRendererParams.radius[circleIndex];
+
+        // compute the bounding box of the circle.  This bounding box
+        // is in normalized coordinates
+        float minX = px - rad;
+        float maxX = px + rad;
+        float minY = py - rad;
+        float maxY = py + rad;
+
+        // do nothing if the current pixel is not within the bounding box
+        if (pixel_center_norm_x < minX || pixel_center_norm_x > maxX || pixel_center_norm_y < minY || pixel_center_norm_y > maxY)  continue;
+        
+        float2 pc = make_float2(pixel_center_norm_x, pixel_center_norm_y);
+        float3 pos = make_float3(px, py, pz);
+
+        existing_color = shade(circleIndex, pc, pos, existing_color);
+    }
+    return existing_color;
+}
+
 //kernelMapCircleIds -- (CUDA device code)
 //
 // This will be a single kernel where we:
 // 1) flag which circles belong to each tile
 // 2) perform an exclusive scan 
 // 3) map the circle indices we care about to global memory
-__global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int tile_size) {
+template <typename ShadeFunc>
+__global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int tile_size, ShadeFunc shade) {
     int tile_index = blockIdx.x;
     int in_block_tid = threadIdx.x;
 
     __shared__ uint flags[SCAN_BLOCK_DIM];
     __shared__ uint prefix_sum_output[SCAN_BLOCK_DIM];
     __shared__ uint prefix_sum_scratch[2 * SCAN_BLOCK_DIM];
+    __shared__ uint circle_index[SCAN_BLOCK_DIM];
     __shared__ int prev_prefix_sum;
+    __shared__ int last_index;
 
     if (in_block_tid == 0) {
         prev_prefix_sum = 0;
+        last_index = ((circles_pow_2 + blockDim.x - 1) / blockDim.x) * blockDim.x;
     }
     __syncthreads();
 
-    for (int i = in_block_tid; i < circles_pow_2; i += blockDim.x) {
+    /** every block should calculate its pixel index */
+    float pixel_center_norm_x = getPixelX(tile_index, in_block_tid, tile_size);
+    float pixel_center_norm_y = getPixelY(tile_index, in_block_tid, tile_size);
+    float4* img_ptr = getImgPtr(tile_index, in_block_tid, tile_size);
+    float4 existing_color = *img_ptr;
+
+    //int last_index = ((circles_pow_2 + blockDim.x - 1) / blockDim.x) * blockDim.x;
+    for (int i = in_block_tid; i < last_index; i += blockDim.x) {
         // set flags appropriately
         if (i >= cuConstRendererParams.numCircles) {
             flags[in_block_tid] = 0;
@@ -556,15 +624,23 @@ __global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int t
 
         // write to global memory
         if (flags[in_block_tid] == 1) {
-            int current_row_index = tile_index * cuConstRendererParams.numCircles;
-            circle_indices[prefix_sum_output[in_block_tid] + prev_prefix_sum + current_row_index] = i;
+            // int current_row_index = tile_index * cuConstRendererParams.numCircles;
+            circle_index[prefix_sum_output[in_block_tid]] = i;
+            // circle_indices[prefix_sum_output[in_block_tid] + prev_prefix_sum + current_row_index] = i;
         }
         __syncthreads();
-        if (in_block_tid == 0) {
-            prev_prefix_sum += (prefix_sum_output[SCAN_BLOCK_DIM - 1] + flags[SCAN_BLOCK_DIM - 1]);
-        }
+        // if (in_block_tid == 0) {
+        //     prev_prefix_sum += (prefix_sum_output[SCAN_BLOCK_DIM - 1] + flags[SCAN_BLOCK_DIM - 1]);
+        // }
+        // __syncthreads();
+        
+        // do the pixel calculation
+        existing_color = getNewColor(circle_index, pixel_center_norm_x, pixel_center_norm_y, existing_color, shade, i / blockDim.x);
+        __syncthreads();
+        circle_index[in_block_tid] = 0;
         __syncthreads();
     }
+    *img_ptr = existing_color;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -677,8 +753,8 @@ CudaRenderer::setup() {
     num_tiles = total_pixels / 1024; 
     tile_size = 32;
     total_length = num_tiles * numCircles;
-    cudaCheckError(cudaMalloc(&circle_indices, total_length * sizeof(int)));
-    cudaMemset(circle_indices, 0, total_length * sizeof(int));
+    // cudaCheckError(cudaMalloc(&circle_indices, total_length * sizeof(int)));
+    // cudaMemset(circle_indices, 0, total_length * sizeof(int));
 
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
@@ -789,16 +865,21 @@ CudaRenderer::render() {
     dim3 gridDim(num_tiles);
 
     /** run kernel to map tile->circle_index */
-    kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size);
+    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size, ShadePixelSnowflake());
+    } else {
+        kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size, ShadePixel());
+    }
     cudaDeviceSynchronize();
 
-    /** parallelize across pixels */
+    /**
+    // parallelize across pixels
     dim3 gridDim_2((total_pixels + blockDim.x - 1) / blockDim.x);
     if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
         kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixelSnowflake(), circle_indices, tile_size);
     } else {
         kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixel(), circle_indices, tile_size);
     }
-    cudaDeviceSynchronize();
+    cudaDeviceSynchronize(); */
 }
 
