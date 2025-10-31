@@ -15,7 +15,7 @@
 #include "util.h"
 #include "circleBoxTest.cu_inl"
 
-#define SCAN_BLOCK_DIM   256
+#define SCAN_BLOCK_DIM   1024
 #include "exclusiveScan.cu_inl"
 
 #include <thrust/device_ptr.h>    
@@ -59,14 +59,6 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
-};
-
-struct RowID {
-    int numCols;
-    __host__ __device__
-    int operator()(int i) const {
-        return i / numCols;
-    }
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -370,50 +362,17 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, floa
     float3 rgb;
     float alpha;
 
-    // there is a non-zero contribution.  Now compute the shading value
-
-    // suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks etc to implement the conditional.  It
-    // would be wise to perform this logic outside of the loop next in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
-    // if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-
-    //     const float kCircleMaxAlpha = .5f;
-    //     const float falloffScale = 4.f;
-
-    //     float normPixelDist = sqrt(pixelDist) / rad;
-    //     rgb = lookupColor(normPixelDist);
-
-    //     float maxAlpha = .6f + .4f * (1.f-p.z);
-    //     maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
-    //     alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
-    // } else {
-    //     // simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
-        alpha = .5f;
-    // }
+    int index3 = 3 * circleIndex;
+    rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+    alpha = .5f;
 
     float oneMinusAlpha = 1.f - alpha;
-
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
-
-    //float4 existingColor = *imagePtr;
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
     return newColor;
-
-    // global memory write
-    //*imagePtr = newColor;
-
-    // END SHOULD-BE-ATOMIC REGION
 }
 
 // shadePixelSnowflake -- (CUDA device code)
@@ -477,7 +436,7 @@ struct ShadePixelSnowflake {
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
 template <typename ShadeFunc>
-__global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int numTiles, int tile_size) {
+__global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int tile_size) {
 
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
@@ -490,7 +449,6 @@ __global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int nu
     // so we can match it to the other circles
     int x = index % width;
     int y = index / width;
-    // printf("this has coordinates (%d, %d)\n", x, y);
 
     float invWidth = 1.f / width;
     float invHeight = 1.f / height;
@@ -502,9 +460,7 @@ __global__ void kernelRenderCircles(ShadeFunc shade, int *circle_indices, int nu
 
     // figure out what tile we are in
     int tile_index = ((x / tile_size) + (y / tile_size) * (width / tile_size));
-    //printf("Current tile is %d\t", tile_index);
-    // if (tile_index == 100) 
-    //     printf("TRUE\n");
+
     // get the index of the beginning of circle indices
     int start_circle_index = tile_index * (cuConstRendererParams.numCircles);
     
@@ -572,13 +528,12 @@ boxCircleIntersect(int tile_index, int circle_index, int tile_size) {
 // 2) perform an exclusive scan 
 // 3) map the circle indices we care about to global memory
 __global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int tile_size) {
-    const uint BLOCKSIZE = 256;
     int tile_index = blockIdx.x;
     int in_block_tid = threadIdx.x;
 
-    __shared__ uint flags[BLOCKSIZE];
-    __shared__ uint prefix_sum_output[BLOCKSIZE];
-    __shared__ uint prefix_sum_scratch[2 * BLOCKSIZE];
+    __shared__ uint flags[SCAN_BLOCK_DIM];
+    __shared__ uint prefix_sum_output[SCAN_BLOCK_DIM];
+    __shared__ uint prefix_sum_scratch[2 * SCAN_BLOCK_DIM];
     __shared__ int prev_prefix_sum;
 
     if (in_block_tid == 0) {
@@ -596,7 +551,7 @@ __global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int t
 
         __syncthreads();
         // perform prefix scans
-        sharedMemExclusiveScan(in_block_tid, flags, prefix_sum_output, prefix_sum_scratch, BLOCKSIZE);
+        sharedMemExclusiveScan(in_block_tid, flags, prefix_sum_output, prefix_sum_scratch, SCAN_BLOCK_DIM);
         __syncthreads();
 
         // write to global memory
@@ -606,7 +561,7 @@ __global__ void kernelMapCircleIds(int *circle_indices, int circles_pow_2, int t
         }
         __syncthreads();
         if (in_block_tid == 0) {
-            prev_prefix_sum += (prefix_sum_output[BLOCKSIZE - 1] + flags[BLOCKSIZE - 1]);
+            prev_prefix_sum += (prefix_sum_output[SCAN_BLOCK_DIM - 1] + flags[SCAN_BLOCK_DIM - 1]);
         }
         __syncthreads();
     }
@@ -718,10 +673,10 @@ CudaRenderer::setup() {
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
 
     /** allocate the memory for storing our circle indices */
-    int totalPixels = image->height * image->width;
-    // we want each tile to be 64 x 64, unless the image is too big
-    int numTiles = totalPixels / 4096; 
-    int total_length = numTiles * numCircles;
+    total_pixels = image->height * image->width;
+    num_tiles = total_pixels / 1024; 
+    tile_size = 32;
+    total_length = num_tiles * numCircles;
     cudaCheckError(cudaMalloc(&circle_indices, total_length * sizeof(int)));
     cudaMemset(circle_indices, 0, total_length * sizeof(int));
 
@@ -829,26 +784,20 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-    int totalPixels = image->height * image->width;
-
-    // we want each tile to be 64 x 64, unless the image is too big
-    int numTiles = totalPixels / 4096; 
-    int tile_size = 64;
-
     /** formally create block dimensions */
-    dim3 blockDim(256, 1);
-    dim3 gridDim(numTiles);
+    dim3 blockDim(SCAN_BLOCK_DIM, 1);
+    dim3 gridDim(num_tiles);
 
     /** run kernel to map tile->circle_index */
     kernelMapCircleIds<<<gridDim, blockDim>>>(circle_indices, nextPow2(numCircles), tile_size);
     cudaDeviceSynchronize();
 
     /** parallelize across pixels */
-    dim3 gridDim_2((totalPixels + blockDim.x - 1) / blockDim.x);
+    dim3 gridDim_2((total_pixels + blockDim.x - 1) / blockDim.x);
     if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
-        kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixelSnowflake(), circle_indices, numTiles, tile_size);
+        kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixelSnowflake(), circle_indices, tile_size);
     } else {
-        kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixel(), circle_indices, numTiles, tile_size);
+        kernelRenderCircles<<<gridDim_2, blockDim>>>(ShadePixel(), circle_indices, tile_size);
     }
     cudaDeviceSynchronize();
 }
