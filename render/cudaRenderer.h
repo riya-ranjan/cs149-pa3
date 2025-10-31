@@ -20,11 +20,9 @@ class CudaRenderer : public CircleRenderer {
   float* cudaDeviceRadius;
   float* cudaDeviceImageData;
 
-  int *circle_indices;
   int tile_size;
   int num_tiles;
   int total_pixels;
-  int total_length;
 
  public:
   CudaRenderer();
